@@ -6,6 +6,13 @@ bool Filter::allowPacketForward(const mesh::Packet* packet) {
   // do not filter direct
   if (packet->isRouteDirect()) return true;
 
+  // blocked nodes (checked before priority so a blocked node cannot whitelist
+  // itself via the ACL)
+  if (isNodeBlocked(packet)) {
+    _cnt.node++;
+    return false;
+  }
+
   // priority
   if (hasPriority(packet)) return true;
 
@@ -83,6 +90,83 @@ bool Filter::hasPriority(const mesh::Packet* packet) {
   return false;
 }
 
+bool Filter::isNodeBlocked(const mesh::Packet* packet) const {
+  if (NodeBlock::isEmpty(_prefs.blocked_nodes, FILTER_NODE_COUNT)) return false;
+
+  // transit: any repeater that already forwarded this flood packet appended its
+  // own hash to the path
+  uint8_t hop_count = packet->getPathHashCount();
+  if (hop_count > 0) {
+    if (NodeBlock::matchesPath(_prefs.blocked_nodes, FILTER_NODE_COUNT,
+                               packet->path, hop_count, packet->getPathHashSize())) {
+      return true;
+    }
+  }
+
+  uint8_t type = packet->getPayloadType();
+
+  // advert: the full public key is carried in payload[0..PUB_KEY_SIZE-1]
+  if (type == PAYLOAD_TYPE_ADVERT) {
+    if (packet->payload_len >= PUB_KEY_SIZE &&
+        NodeBlock::inList(_prefs.blocked_nodes, FILTER_NODE_COUNT, packet->payload, PUB_KEY_SIZE)) {
+      return true;
+    }
+  }
+
+  // originator: src hash (payload[1]) for the identity-bearing payload types
+  if (type == PAYLOAD_TYPE_REQ || type == PAYLOAD_TYPE_RESPONSE ||
+      type == PAYLOAD_TYPE_TXT_MSG || type == PAYLOAD_TYPE_PATH) {
+    if (packet->payload_len >= 2 &&
+        NodeBlock::inList(_prefs.blocked_nodes, FILTER_NODE_COUNT, &packet->payload[1], 1)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool Filter::addNode(const uint8_t* key, uint8_t key_len) {
+  return NodeBlock::add(_prefs.blocked_nodes, FILTER_NODE_COUNT, key, key_len);
+}
+
+bool Filter::removeNode(const uint8_t* key, uint8_t key_len) {
+  return NodeBlock::remove(_prefs.blocked_nodes, FILTER_NODE_COUNT, key, key_len);
+}
+
+void Filter::listNodeKeys(char* out_buf, size_t out_size) {
+  if (out_buf == nullptr || out_size == 0) return;
+
+  out_buf[0] = '\0';
+  size_t pos = 0;
+  char key_hex[2 * 6 + 1];   // show up to 6 leading bytes per entry
+
+  for (int i = 0; i < FILTER_NODE_COUNT; i++) {
+    const BlockedNode& n = _prefs.blocked_nodes[i];
+    if (n.key_len == 0) continue;
+
+    // append comma
+    if (pos > 0 && pos + 1 < out_size) {
+      out_buf[pos++] = ',';
+      out_buf[pos] = '\0';
+    }
+
+    size_t rem = out_size - pos;
+    if (rem == 0) break;
+
+    uint8_t show = (n.key_len < 6) ? n.key_len : 6;
+    mesh::Utils::toHex(key_hex, n.key, show);
+    int written = snprintf(out_buf + pos, rem, "%s%s", key_hex, (n.key_len > show) ? ".." : "");
+    if (written < 0) break;
+    size_t adv = (static_cast<size_t>(written) < rem) ? static_cast<size_t>(written) : rem - 1;
+    pos += adv;
+    out_buf[pos] = '\0';
+    if (adv == rem - 1) break;   // buffer full
+  }
+
+  // no blocked nodes
+  if (!pos) strcpy(out_buf, "None");
+}
+
 void Filter::handleCommand(FILESYSTEM* fs, char* command, char* reply) {
   const char* parts[6];
   int n = mesh::Utils::parseTextParts(command, parts, 6, ' ');
@@ -94,14 +178,14 @@ void Filter::handleCommand(FILESYSTEM* fs, char* command, char* reply) {
       hops_total += _cnt.hops[i];
       rate_total += _cnt.rate[i];
     }
-    sprintf(reply, "> Filter %s: Blocked [ Hops: %d | Rate: %d | Channel: %d | Hash: %d | Malformed: %d ]",
+    sprintf(reply, "> Filter %s: Blocked [ Hops: %d | Rate: %d | Channel: %d | Hash: %d | Malformed: %d | Node: %d ]",
         _prefs.filter_enabled ? "on" : "off",
-        hops_total, rate_total, _cnt.channel, _cnt.hash, _cnt.malformed);
+        hops_total, rate_total, _cnt.channel, _cnt.hash, _cnt.malformed, _cnt.node);
   }
 
   if (n == 2) {
     if (strcmp(parts[1], "help") == 0) {
-      strcpy(reply, "> filter [ help | on | off | reset | types | count | hops <args> | rate <args> | channel <args> | hash <min_bytes> | malformed <on | off> ]");
+      strcpy(reply, "> filter [ help | on | off | reset | types | count | hops <args> | rate <args> | channel <args> | block <args> | hash <min_bytes> | malformed <on | off> ]");
     } else if (strcmp(parts[1], "types") == 0) {
       strcpy(reply, "00=REQ\n01=RESPONSE\n02=TXT_MSG\n03=ACK\n04=ADVERT\n05=GRP_TXT\n06=GRP_DATA\n07=ANON_REQ\n08=PATH\n09=TRACE\n10=MULTIPART\n11=CONTROL");
     } else if (strcmp(parts[1], "on") == 0) {
@@ -124,6 +208,8 @@ void Filter::handleCommand(FILESYSTEM* fs, char* command, char* reply) {
       formatResponse(reply, ResponseType::RATE);
     } else if (strcmp(parts[1], "channel") == 0) {
       strcpy(reply, "> filter channel [list | add | remove] <#name | Public>");
+    } else if (strcmp(parts[1], "block") == 0) {
+      strcpy(reply, "> filter block [list | add | remove] <hex_pubkey>");
     } else if (strcmp(parts[1], "hash") == 0) {
       sprintf(reply, "> Filter: minimal %d bytes path hash size", _prefs.minimal_hash_bytes);
     } else if (strcmp(parts[1], "malformed") == 0) {
@@ -197,6 +283,38 @@ void Filter::handleCommand(FILESYSTEM* fs, char* command, char* reply) {
         }
       } else {
         strcpy(reply, "> Filter: syntax error 'filter channel [list | add | remove] <#name | Public>'");
+      }
+
+    // block (by node public key / prefix)
+    } else if (strcmp(parts[1], "block") == 0) {
+
+      if (strcmp(parts[2], "list") == 0) {
+        listNodeKeys(reply, 160);
+      } else if (n >= 4 && (strcmp(parts[2], "add") == 0 || strcmp(parts[2], "remove") == 0)) {
+        const char* hex = parts[3];
+        int hex_len = strlen(hex);
+        int key_len = hex_len / 2;
+        uint8_t key[PUB_KEY_SIZE];
+
+        if (key_len < 1 || key_len > PUB_KEY_SIZE || !mesh::Utils::fromHex(key, key_len, hex)) {
+          strcpy(reply, "> Filter: error bad hex pubkey (1-32 bytes)");
+        } else if (strcmp(parts[2], "add") == 0) {
+          if (addNode(key, key_len)) {
+            sprintf(reply, "> Filter: node %s blocked (2/3-byte hops precise; 1-byte over-blocks)", hex);
+            save(fs);
+          } else {
+            strcpy(reply, "> Filter: error blocklist full");
+          }
+        } else {  // remove
+          if (removeNode(key, key_len)) {
+            sprintf(reply, "> Filter: node %s unblocked", hex);
+            save(fs);
+          } else {
+            strcpy(reply, "> Filter: error node not found");
+          }
+        }
+      } else {
+        strcpy(reply, "> Filter: syntax error 'filter block [list | add | remove] <hex_pubkey>'");
       }
 
     // hash
@@ -447,6 +565,9 @@ bool Filter::load(FILESYSTEM* fs) {
   }
   _prefs.minimal_hash_bytes = constrain(_prefs.minimal_hash_bytes, 1, 3);
   _prefs.filter_malformed = constrain(_prefs.filter_malformed, 0, 1);
+  for (uint8_t i = 0; i < FILTER_NODE_COUNT; ++i) {
+    _prefs.blocked_nodes[i].key_len = constrain(_prefs.blocked_nodes[i].key_len, 0, PUB_KEY_SIZE);
+  }
 
   file.close();
   return true;

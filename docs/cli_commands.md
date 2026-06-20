@@ -200,7 +200,7 @@ The packet filter drops flood (multi-hop) packets that exceed configurable limit
 
 **Filtering only applies when enabled** (`filter on`) and never affects:
 - Directly-routed packets (only flood packets are filtered).
-- Packets to or from a contact in the node's [ACL](#acl) (these are always prioritized for `REQ`, `RESPONSE`, `TXT_MSG`, `ANON_REQ` and `PATH` payload types).
+- Packets to or from a contact in the node's [ACL](#acl) (these are always prioritized for `REQ`, `RESPONSE`, `TXT_MSG`, `ANON_REQ` and `PATH` payload types) — **except** packets matching the [node blocklist](#block-nodes-by-public-key), which are always dropped.
 
 Many subcommands act on a **payload type**, identified by an index. Use `filter types` to list them:
 
@@ -223,7 +223,7 @@ Many subcommands act on a **payload type**, identified by an index. Use `filter 
 ### Show blocked-packet summary
 **Usage:** `filter`
 
-**Note:** Shows whether the filter is on/off and total packets blocked, broken down by reason: `Hops`, `Rate`, `Channel`, `Hash` and `Malformed`. Counters are cleared by [`clear stats`](#clear-stats).
+**Note:** Shows whether the filter is on/off and total packets blocked, broken down by reason: `Hops`, `Rate`, `Channel`, `Hash`, `Malformed` and `Node`. Counters are cleared by [`clear stats`](#clear-stats).
 
 ---
 
@@ -237,7 +237,7 @@ Many subcommands act on a **payload type**, identified by an index. Use `filter 
 ### Reset filter preferences to defaults
 **Usage:** `filter reset`
 
-**Warning:** Restores all filter settings (hops, rates, channels, hash size, malformed scan) to their defaults.
+**Warning:** Restores all filter settings (hops, rates, channels, blocked nodes, hash size, malformed scan) to their defaults.
 
 ---
 
@@ -286,6 +286,32 @@ Many subcommands act on a **payload type**, identified by an index. Use `filter 
 - `name`: Channel name to block, or `Public` for the public channel. Group-text packets on a blocked channel are dropped.
 
 **Note:** Up to 16 channels can be blocked.
+
+---
+
+### Block nodes by public key
+**Usage:**
+- `filter block list`
+- `filter block add <hex_pubkey>`
+- `filter block remove <hex_pubkey>`
+
+**Parameters:**
+- `hex_pubkey`: A node's public key as hex, `1`–`32` bytes (`2`–`64` hex chars). You can paste a full key or just a leading prefix.
+
+**Note:** Blocks a node across all three points where it can be identified on the wire:
+- **As originator** — its own `REQ`, `RESPONSE`, `TXT_MSG` and `PATH` packets (matched on the 1-byte source hash).
+- **In transit** — any flood packet that already passed through it as a repeater (matched against every hop in the packet's path).
+- **By advert** — its `ADVERT` packets (matched against the full public key), which stops it from being (re)discovered.
+
+Blocked nodes are dropped even when they would otherwise be prioritized as an [ACL](#acl) contact.
+
+**Precision:** how many bytes are matched — and therefore the collateral — depends on the scope:
+
+- **Transit** matches each path hop at the packet's own path-hash width. Collision odds with an unrelated node are ~1/256 (1-byte hops), ~1/65,000 (2-byte) or ~1/16,000,000 (3-byte). Networks that originate with 2–3 byte path hashes (the common default in some regions, e.g. NL) therefore get very low transit collateral automatically. To *guarantee* it, set [`filter hash 2`](#minimum-path-hash-size) to refuse 1-byte-hash flood traffic outright.
+- **Originator** matches the payload's source hash, which is always **1 byte** in the current protocol → ~1/256 collisions. This is the least relevant scope for repeaters/bridges, which forward far more than they originate.
+- **Advert** matches the full 32-byte key → exact, no collisions.
+
+Up to 16 nodes can be blocked.
 
 ---
 

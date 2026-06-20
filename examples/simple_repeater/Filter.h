@@ -6,6 +6,8 @@
 #include <helpers/ClientACL.h>
 #include <helpers/TxtDataHelpers.h>
 
+#include "NodeBlocklist.h"
+
 #define FILTER_PREFS_FILE    "/filter_prefs"
 #define FILTER_CHANNEL_COUNT 16
 
@@ -53,6 +55,10 @@ struct FilterPrefs {
   ChannelDetails filter_channels[FILTER_CHANNEL_COUNT];
   uint8_t minimal_hash_bytes = 1;
   uint8_t filter_malformed = false;
+  // New fields MUST be appended at the end: FilterPrefs is persisted as a raw
+  // blob, and keeping existing offsets lets older /filter_prefs files still load
+  // (the trailing blocklist simply defaults to empty on upgrade).
+  BlockedNode blocked_nodes[FILTER_NODE_COUNT];
 };
 
 struct Counters {
@@ -61,6 +67,7 @@ struct Counters {
   uint16_t channel = 0;
   uint16_t hash = 0;
   uint16_t malformed = 0;
+  uint16_t node = 0;
 };
 
 class Limiter {
@@ -108,6 +115,10 @@ public:
   void resetStats(void) { _cnt = Counters(); }
   bool allowPacketForward(const mesh::Packet *packet);
   bool hasPriority(const mesh::Packet *packet);
+  bool isNodeBlocked(const mesh::Packet *packet) const;
+  bool addNode(const uint8_t *key, uint8_t key_len);
+  bool removeNode(const uint8_t *key, uint8_t key_len);
+  void listNodeKeys(char *out_buf, size_t out_size);
   void handleCommand(FILESYSTEM *fs, char *command, char *reply);
   void formatResponse(char *reply, ResponseType rtype);
   bool addChannel(const char *name);
